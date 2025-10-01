@@ -1,0 +1,109 @@
+name: Update Language Table (LOC Ratio)
+
+on:
+  schedule:
+    - cron: "0 12 * * *"   # runs daily at 7:00 AM Central
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  loc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cloc jq
+
+      - name: Auth GH CLI
+        env:
+          GH_TOKEN: ${{ secrets.GH_PRIVATE_TOKEN }}
+        run: |
+          echo "${GH_TOKEN}" | gh auth login --with-token
+
+      - name: Fetch repo list (public + private, no forks/archived)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PRIVATE_TOKEN }}
+        run: |
+          gh repo list gunnarhurst --limit 40 --json name,visibility,isFork,isArchived,pushedAt,defaultBranchRef > repos.json
+          jq '[ .[] | select((.isFork|not) and (.isArchived|not)) | .name ]' repos.json > names.json
+          mkdir -p repos
+          for n in $(jq -r '.[]' names.json | head -n 20); do
+            echo "Cloning $n"
+            git clone --depth 1 "https://${GH_TOKEN}:x-oauth-basic@github.com/gunnarhurst/$n.git" "repos/$n" || true
+          done
+
+      - name: Run CLOC across repos
+        run: |
+          cloc repos --json --quiet --exclude-dir=node_modules,dist,build,bin,obj,.git > cloc.json || echo '{"header":{},"SUM":{"code":0}}' > cloc.json
+          cat cloc.json
+
+      - name: Build LOC ratio table and update README
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+
+          const cloc = JSON.parse(fs.readFileSync('cloc.json','utf8'));
+          const entries = Object.entries(cloc)
+            .filter(([k,v]) => k !== 'header' && k !== 'SUM' && v && typeof v.code === 'number')
+            .map(([lang, stats]) => ({ lang, code: stats.code }))
+            .filter(e => e.code > 0);
+
+          const total = entries.reduce((a,b)=>a+b.code,0);
+          const sorted = entries.sort((a,b)=>b.code - a.code).slice(0, 12);
+          const percent = x => (x/total*100);
+
+          const emo = (l) => {
+            const t = l.toLowerCase();
+            if (t.includes('java')) return '☕️';
+            if (t.includes('typescript')) return '🔷';
+            if (t === 'javascript') return '🟨';
+            if (t.includes('react')) return '⚛️';
+            if (t === 'sql' || t.includes('pl/sql')) return '🗄️';
+            if (t === 'c#' || t.includes('c#')) return '🟣';
+            if (t.includes('json')) return '🧾';
+            if (t.includes('yaml') || t.includes('yml')) return '📄';
+            if (t.includes('shell')) return '💻';
+            return '📦';
+          };
+
+          const bar = (p) => {
+            const blocks = Math.round(p / 5);
+            return '█'.repeat(blocks).padEnd(20, '░');
+          };
+
+          let table = `\n\n| Lang | % | LOC | Bar |\n|---|---:|---:|:---|\n`;
+          for (const e of sorted) {
+            const p = percent(e.code);
+            table += `| ${emo(e.lang)} ${e.lang} | ${p.toFixed(1)}% | ${e.code.toLocaleString()} | ${bar(p)} |\n`;
+          }
+          if (!sorted.length) table += `| (no code measured) | 0% | 0 | |\n`;
+
+          const readmePath = 'README.md';
+          const md = fs.readFileSync(readmePath,'utf8');
+          const start = '<!--LANG_TABLE_START-->';
+          const end = '<!--LANG_TABLE_END-->';
+          const startIdx = md.indexOf(start);
+          const endIdx = md.indexOf(end);
+          if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
+            console.error('Markers not found in README.md');
+            process.exit(1);
+          }
+          const before = md.slice(0, startIdx + start.length);
+          const after  = md.slice(endIdx);
+          const next = before + table + '\n' + after;
+          fs.writeFileSync(readmePath, next);
+          console.log('README updated.');
+          NODE
+
+      - name: Commit updated README
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: update language LOC ratio table" || echo "No changes"
+          git push
