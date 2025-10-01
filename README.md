@@ -19,11 +19,10 @@
 
 ---
 
-## 📊 Languages on my GitHub (private aware)
+## 📊 Language LOC ratio on my GitHub (private aware)
 
-<p align="center">
-  <img src="assets/top-langs.svg" alt="Top languages" />
-</p>
+<!--LANG_TABLE_START-->
+<!--LANG_TABLE_END-->
 
 ---
 
