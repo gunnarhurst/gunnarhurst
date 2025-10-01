@@ -1,8 +1,8 @@
-name: Update Language Table (LOC Ratio)
+name: Update Language Table (LOC Ratio - Core Stack Only)
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # 7:00 AM Central
+    - cron: "0 12 * * *"   # 7:00 AM America/Chicago
   workflow_dispatch:
 
 permissions:
@@ -12,7 +12,7 @@ jobs:
   loc:
     runs-on: ubuntu-latest
     env:
-      OWNER: gunnarhurst              
+      OWNER: gunnarhurst            
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +30,6 @@ jobs:
           echo "[]" > repos.json
           # Fetch up to 300 repos (3 pages x 100)
           for page in 1 2 3; do
-            echo "Fetching page $page..."
             curl -s -H "Authorization: token $PAT" \
                  "https://api.github.com/user/repos?per_page=100&page=${page}&type=owner&sort=pushed" \
                  > page.json
@@ -39,7 +38,6 @@ jobs:
               break
             fi
           done
-
           # Keep only non-fork, non-archived repos owned by $OWNER
           jq --arg OWNER "$OWNER" '
             [ .[]
@@ -47,9 +45,6 @@ jobs:
               | select((.fork | not) and (.archived | not))
               | {name: .name, full_name: .full_name}
             ]' repos.json > names.json
-
-          echo "Selected repos:"
-          cat names.json
 
       - name: Clone selected repos (limit to 25 most-recent)
         env:
@@ -65,54 +60,63 @@ jobs:
 
       - name: Run CLOC across repos
         run: |
+          # Exclude common build/vendor dirs; adjust if needed
           cloc repos \
             --json --quiet \
             --exclude-dir=node_modules,dist,build,bin,obj,.git,coverage,.next,out \
             > cloc.json || echo '{"header":{},"SUM":{"code":0}}' > cloc.json
-          echo "CLOC (truncated):"
-          head -n 50 cloc.json || true
+          head -n 40 cloc.json || true
 
-      - name: Build LOC ratio table and update README
+      - name: Build LOC ratio table (core stack only) and update README
         run: |
           cat > build.js <<'NODE'
           const fs = require('fs');
 
           const cloc = JSON.parse(fs.readFileSync('cloc.json','utf8'));
-          const entries = Object.entries(cloc)
-            .filter(([k,v]) => k !== 'header' && k !== 'SUM' && v && typeof v.code === 'number')
-            .map(([lang, stats]) => ({ lang, code: stats.code }))
-            .filter(e => e.code > 0);
 
-          const total = entries.reduce((a,b)=>a+b.code,0);
-          const sorted = entries.sort((a,b)=>b.code - a.code).slice(0, 12);
-          const percent = x => total ? (x/total*100) : 0;
-
-          const emo = (l) => {
-            const t = l.toLowerCase();
-            if (t.includes('java')) return '☕️';
-            if (t.includes('typescript')) return '🔷';
-            if (t === 'javascript') return '🟨';
-            if (t.includes('tsx') || t.includes('jsx') || t.includes('react')) return '⚛️';
-            if (t === 'sql' || t.includes('pl/sql')) return '🗄️';
-            if (t === 'c#' || t.includes('c#')) return '🟣';
-            if (t.includes('json')) return '🧾';
-            if (t.includes('yaml') || t.includes('yml')) return '📄';
-            if (t.includes('shell') || t.includes('bash')) return '💻';
-            return '📦';
-          };
-
-          const bar = (p) => {
-            const blocks = Math.round(p / 5); // 20-wide bar
-            return '█'.repeat(blocks).padEnd(20, '░');
-          };
-
-          let table = `\n\n| Lang | % | LOC | Bar |\n|---|---:|---:|:---|\n`;
-          for (const e of sorted) {
-            const p = percent(e.code);
-            table += `| ${emo(e.lang)} ${e.lang} | ${p.toFixed(1)}% | ${e.code.toLocaleString()} | ${bar(p)} |\n`;
+          // Map cloc language names into core buckets we care about
+          function bucketName(lang) {
+            const t = lang.toLowerCase();
+            // order matters to avoid "java" matching "javascript"
+            if (t.includes('javascript') || t === 'jsx' || t.includes('javascript jsx')) return 'JavaScript';
+            if (t.includes('typescript') || t === 'tsx' || t.includes('typescript jsx')) return 'TypeScript';
+            if (t === 'java') return 'Java';
+            if (t === 'c#' || t.includes('c#')) return 'C#';
+            if (t === 'sql' || t.includes('pl/sql') || t.includes('tsql') || t.includes('plsql')) return 'SQL';
+            return null; // everything else is ignored (shell, yaml, json, markdown, xml, etc.)
           }
-          if (!sorted.length) table += `| (no code measured) | 0% | 0 | |\n`;
 
+          // Aggregate LOC into buckets
+          const buckets = new Map([['Java',0],['TypeScript',0],['JavaScript',0],['SQL',0],['C#',0]]);
+          for (const [lang, stats] of Object.entries(cloc)) {
+            if (!stats || typeof stats.code !== 'number') continue;
+            if (lang === 'header' || lang === 'SUM') continue;
+            const b = bucketName(lang);
+            if (b && buckets.has(b)) buckets.set(b, buckets.get(b) + stats.code);
+          }
+
+          // Remove zero buckets
+          const entries = Array.from(buckets.entries()).filter(([,loc]) => loc > 0);
+          const total = entries.reduce((a,[,loc]) => a + loc, 0);
+
+          // Sort by LOC desc, keep top 5 (or all if fewer)
+          entries.sort((a,b) => b[1] - a[1]);
+
+          // Build clean table (no bar)
+          let table = `\n\n| Lang | % | LOC |\n|---|---:|---:|\n`;
+          for (const [name, loc] of entries) {
+            const pct = total ? (loc/total*100) : 0;
+            const emoji =
+              name === 'Java' ? '☕️' :
+              name === 'TypeScript' ? '🔷' :
+              name === 'JavaScript' ? '🟨' :
+              name === 'SQL' ? '🗄️' :
+              name === 'C#' ? '🟣' : '📦';
+            table += `| ${emoji} ${name} | ${pct.toFixed(1)}% | ${loc.toLocaleString()} |\n`;
+          }
+          if (!entries.length) table += `| (no core stack code measured yet) | 0% | 0 |\n`;
+
+          // Inject into README between markers
           const readmePath = 'README.md';
           const md = fs.existsSync(readmePath) ? fs.readFileSync(readmePath,'utf8') : '';
           const start = '<!--LANG_TABLE_START-->';
@@ -120,15 +124,13 @@ jobs:
           const startIdx = md.indexOf(start);
           const endIdx = md.indexOf(end);
           if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
-            console.error('Markers not found in README.md. Add:');
-            console.error('<!--LANG_TABLE_START-->\n<!--LANG_TABLE_END-->');
+            console.error('Markers not found in README.md. Add:\n<!--LANG_TABLE_START-->\n<!--LANG_TABLE_END-->');
             process.exit(1);
           }
           const before = md.slice(0, startIdx + start.length);
           const after  = md.slice(endIdx);
-          const next = before + table + '\n' + after;
-          fs.writeFileSync(readmePath, next);
-          console.log('README updated.');
+          fs.writeFileSync(readmePath, before + table + '\n' + after);
+          console.log('README updated with core stack LOC table.');
           NODE
 
           node build.js
@@ -138,5 +140,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add README.md
-          git commit -m "docs: update language LOC ratio table" || echo "No changes"
+          git commit -m "docs: update core-stack LOC language table" || echo "No changes"
           git push
