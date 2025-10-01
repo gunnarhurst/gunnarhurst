@@ -2,7 +2,7 @@ name: Update Language Table (LOC Ratio)
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # runs daily at 7:00 AM Central
+    - cron: "0 12 * * *"   # 7:00 AM Central
   workflow_dispatch:
 
 permissions:
@@ -11,6 +11,8 @@ permissions:
 jobs:
   loc:
     runs-on: ubuntu-latest
+    env:
+      OWNER: gunnarhurst              
     steps:
       - uses: actions/checkout@v4
 
@@ -19,32 +21,60 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cloc jq
 
-      - name: Auth GH CLI
+      - name: Fetch repo list via REST (owner repos, public+private)
         env:
           PAT: ${{ secrets.GH_PRIVATE_TOKEN }}
         run: |
-          echo "${PAT}" | gh auth login --with-token
-
-      - name: Fetch repo list (public + private, no forks/archived)
-        env:
-          PAT: ${{ secrets.GH_PRIVATE_TOKEN }}
-        run: |
-          gh repo list gunnarhurst --limit 40 --json name,visibility,isFork,isArchived,pushedAt,defaultBranchRef > repos.json
-          jq '[ .[] | select((.isFork|not) and (.isArchived|not)) | .name ]' repos.json > names.json
+          set -e
           mkdir -p repos
-          for n in $(jq -r '.[]' names.json | head -n 20); do
-            echo "Cloning $n"
-            git clone --depth 1 "https://${PAT}:x-oauth-basic@github.com/gunnarhurst/$n.git" "repos/$n" || true
+          echo "[]" > repos.json
+          # Fetch up to 300 repos (3 pages x 100)
+          for page in 1 2 3; do
+            echo "Fetching page $page..."
+            curl -s -H "Authorization: token $PAT" \
+                 "https://api.github.com/user/repos?per_page=100&page=${page}&type=owner&sort=pushed" \
+                 > page.json
+            jq -s '.[0] + .[1]' repos.json page.json > tmp.json && mv tmp.json repos.json
+            if [ "$(jq 'length' page.json)" -lt 100 ]; then
+              break
+            fi
+          done
+
+          # Keep only non-fork, non-archived repos owned by $OWNER
+          jq --arg OWNER "$OWNER" '
+            [ .[]
+              | select(.owner.login == $OWNER)
+              | select((.fork | not) and (.archived | not))
+              | {name: .name, full_name: .full_name}
+            ]' repos.json > names.json
+
+          echo "Selected repos:"
+          cat names.json
+
+      - name: Clone selected repos (limit to 25 most-recent)
+        env:
+          PAT: ${{ secrets.GH_PRIVATE_TOKEN }}
+        run: |
+          set -e
+          mkdir -p repos
+          jq -r '.[].full_name' names.json | head -n 25 | while read -r FULL; do
+            echo "Cloning $FULL"
+            REPO_NAME="$(basename "$FULL")"
+            git clone --depth 1 "https://${PAT}:x-oauth-basic@github.com/${FULL}.git" "repos/${REPO_NAME}" || true
           done
 
       - name: Run CLOC across repos
         run: |
-          cloc repos --json --quiet --exclude-dir=node_modules,dist,build,bin,obj,.git > cloc.json || echo '{"header":{},"SUM":{"code":0}}' > cloc.json
-          cat cloc.json
+          cloc repos \
+            --json --quiet \
+            --exclude-dir=node_modules,dist,build,bin,obj,.git,coverage,.next,out \
+            > cloc.json || echo '{"header":{},"SUM":{"code":0}}' > cloc.json
+          echo "CLOC (truncated):"
+          head -n 50 cloc.json || true
 
       - name: Build LOC ratio table and update README
         run: |
-          node - <<'NODE'
+          cat > build.js <<'NODE'
           const fs = require('fs');
 
           const cloc = JSON.parse(fs.readFileSync('cloc.json','utf8'));
@@ -55,6 +85,58 @@ jobs:
 
           const total = entries.reduce((a,b)=>a+b.code,0);
           const sorted = entries.sort((a,b)=>b.code - a.code).slice(0, 12);
-          const percent = x => (x/total*100);
+          const percent = x => total ? (x/total*100) : 0;
 
           const emo = (l) => {
+            const t = l.toLowerCase();
+            if (t.includes('java')) return '☕️';
+            if (t.includes('typescript')) return '🔷';
+            if (t === 'javascript') return '🟨';
+            if (t.includes('tsx') || t.includes('jsx') || t.includes('react')) return '⚛️';
+            if (t === 'sql' || t.includes('pl/sql')) return '🗄️';
+            if (t === 'c#' || t.includes('c#')) return '🟣';
+            if (t.includes('json')) return '🧾';
+            if (t.includes('yaml') || t.includes('yml')) return '📄';
+            if (t.includes('shell') || t.includes('bash')) return '💻';
+            return '📦';
+          };
+
+          const bar = (p) => {
+            const blocks = Math.round(p / 5); // 20-wide bar
+            return '█'.repeat(blocks).padEnd(20, '░');
+          };
+
+          let table = `\n\n| Lang | % | LOC | Bar |\n|---|---:|---:|:---|\n`;
+          for (const e of sorted) {
+            const p = percent(e.code);
+            table += `| ${emo(e.lang)} ${e.lang} | ${p.toFixed(1)}% | ${e.code.toLocaleString()} | ${bar(p)} |\n`;
+          }
+          if (!sorted.length) table += `| (no code measured) | 0% | 0 | |\n`;
+
+          const readmePath = 'README.md';
+          const md = fs.existsSync(readmePath) ? fs.readFileSync(readmePath,'utf8') : '';
+          const start = '<!--LANG_TABLE_START-->';
+          const end = '<!--LANG_TABLE_END-->';
+          const startIdx = md.indexOf(start);
+          const endIdx = md.indexOf(end);
+          if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
+            console.error('Markers not found in README.md. Add:');
+            console.error('<!--LANG_TABLE_START-->\n<!--LANG_TABLE_END-->');
+            process.exit(1);
+          }
+          const before = md.slice(0, startIdx + start.length);
+          const after  = md.slice(endIdx);
+          const next = before + table + '\n' + after;
+          fs.writeFileSync(readmePath, next);
+          console.log('README updated.');
+          NODE
+
+          node build.js
+
+      - name: Commit updated README
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: update language LOC ratio table" || echo "No changes"
+          git push
